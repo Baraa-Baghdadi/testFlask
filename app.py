@@ -216,12 +216,12 @@ def get_video_formats():
 
 @app.route('/api/download', methods=['POST'])
 def start_download():
-    """Start video download"""
+    """Start video download and wait until finished, then return download ID and .mp4 files"""
     try:
         data = request.get_json()
         if not data or 'url' not in data:
             return jsonify({'error': 'URL is required'}), 400
-        
+
         # Check concurrent downloads limit
         active_count = len([d for d in active_downloads.values() 
                            if d['status'] in ['queued', 'downloading']])
@@ -230,7 +230,7 @@ def start_download():
             return jsonify({
                 'error': f'Maximum concurrent downloads ({app.config["MAX_CONCURRENT_DOWNLOADS"]}) reached'
             }), 429
-        
+
         # Generate unique download ID
         download_id = str(uuid.uuid4())
         
@@ -242,7 +242,7 @@ def start_download():
             'playlist': data.get('playlist', False),
             'max_downloads': data.get('max_downloads')
         }
-        
+
         # Store download info
         with download_lock:
             active_downloads[download_id] = {
@@ -252,21 +252,29 @@ def start_download():
                 'options': options,
                 'files': []
             }
-        
-        # Start download in background thread
-        thread = threading.Thread(
-            target=download_worker,
-            args=(download_id, data['url'], options)
-        )
-        thread.daemon = True
-        thread.start()
-        
+
+        # --- Synchronous download ---
+        download_worker(download_id, data['url'], options)
+
+        # Fetch completed download info
+        download_info = active_downloads[download_id]
+        if download_info['status'] != 'completed':
+            return jsonify({
+                'success': False,
+                'download_id': download_id,
+                'status': download_info['status'],
+                'error': download_info.get('error', 'Unknown error')
+            }), 500
+
+        # Filter .mp4 files only
+        mp4_files = [f for f in download_info.get('files', []) if f.lower().endswith('.mp4')]
+
         return jsonify({
             'success': True,
             'download_id': download_id,
-            'message': 'Download started'
-        }), 202
-        
+            'files': mp4_files
+        })
+
     except Exception as e:
         app.logger.error(f"Download start error: {e}")
         return jsonify({'error': str(e)}), 500
