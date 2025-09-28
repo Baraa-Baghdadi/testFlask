@@ -1,0 +1,25 @@
+2025-09-28 14:14:01,468 - INFO - 127.0.0.1 - - [28/Sep/2025 14:14:01] "POST /api/info HTTP/1.1" 200 -
+2025-09-28 14:15:10,489 - INFO - 127.0.0.1 - - [28/Sep/2025 14:15:10] "[35m[1mPOST /api/download HTTP/1.1[0m" 202 -
+2025-09-28 14:15:10,492 - INFO - Starting download from: https://youtube.com/watch?v=dQw4w9WgXcQ
+2025-09-28 14:15:22,061 - INFO - Video: Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)
+2025-09-28 14:15:22,065 - INFO - Uploader: Rick Astley
+2025-09-28 14:15:22,065 - INFO - Duration: 213 seconds
+2025-09-28 14:15:32,184 - ERROR - Download error: [0;31mERROR:[0m [youtube] dQw4w9WgXcQ: Requested format is not available. Use --list-formats for a list of available formats
+2025-09-28 14:16:19,971 - INFO - 127.0.0.1 - - [28/Sep/2025 14:16:19] "POST /api/info HTTP/1.1" 200 -
+2025-09-28 14:17:27,131 - INFO - 127.0.0.1 - - [28/Sep/2025 14:17:27] "POST /api/formats HTTP/1.1" 200 -
+2025-09-28 14:19:12,969 - INFO - 127.0.0.1 - - [28/Sep/2025 14:19:12] "[35m[1mPOST /api/download HTTP/1.1[0m" 202 -
+2025-09-28 14:19:13,339 - INFO - Starting download from: https://www.youtube.com/watch?v=vwoUriuqcio
+2025-09-28 14:19:21,331 - INFO - Video: How to Deploy a Flask App on Render (2025)
+2025-09-28 14:19:21,332 - INFO - Uploader: ProgrammingKnowledge
+2025-09-28 14:19:21,332 - INFO - Duration: 342 seconds
+2025-09-28 14:19:28,608 - ERROR - Download error: [0;31mERROR:[0m [youtube] vwoUriuqcio: Requested format is not available. Use --list-formats for a list of available formats
+2025-09-28 14:20:37,251 - INFO - 127.0.0.1 - - [28/Sep/2025 14:20:37] "[35m[1mPOST /api/download HTTP/1.1[0m" 202 -
+2025-09-28 14:20:37,252 - INFO - Starting download from: https://www.youtube.com/watch?v=vwoUriuqcio
+2025-09-28 14:20:44,670 - INFO - Video: How to Deploy a Flask App on Render (2025)
+2025-09-28 14:20:44,670 - INFO - Uploader: ProgrammingKnowledge
+2025-09-28 14:20:44,670 - INFO - Duration: 342 seconds
+2025-09-28 14:20:53,400 - ERROR - Download error: [0;31mERROR:[0m unable to download video data: HTTP Error 403: Forbidden
+2025-09-28 14:21:57,046 - INFO - 127.0.0.1 - - [28/Sep/2025 14:21:57] "[35m[1mPOST /api/download HTTP/1.1[0m" 202 -
+2025-09-28 14:21:57,362 - INFO - Starting download from: https://www.youtube.com/watch?v=vwoUriuqcio
+2025-09-28 14:22:25,251 - ERROR - Failed to extract video info: [0;31mERROR:[0m [youtube] vwoUriuqcio: Sign in to confirm you’re not a bot. This helps protect our community. Learn more
+2025-09-28 14:22:57,860 - ERROR - Download error: [0;31mERROR:[0m [youtube] vwoUriuqcio: Sign in to confirm you’re not a bot. This helps protect our community. Learn more

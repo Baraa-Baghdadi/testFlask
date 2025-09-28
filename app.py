@@ -1,449 +1,426 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import sqlite3
-import hashlib
-import datetime
+#!/usr/bin/env python3
+"""
+Flask Video Downloader API
+A RESTful API for downloading videos from various platforms
+"""
+
 import os
-from functools import wraps
+import sys
+import uuid
+import threading
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+from flask import Flask, request, jsonify, send_file, abort
+from flask_cors import CORS
+from werkzeug.exceptions import RequestEntityTooLarge
+import logging
+from logging.handlers import RotatingFileHandler
+
+# Import your existing VideoDownloader class
+from video_downloader import VideoDownloader
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
 # Configuration
-DATABASE = 'project_status.db'
-SECRET_TOKEN = 'your-super-secret-token-2024'  # Change this in production
-ADMIN_TOKEN = 'admin-secret-token-2024'        # Change this in production
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max request size
+app.config['DOWNLOADS_DIR'] = os.environ.get('DOWNLOADS_DIR', 'downloads')
+app.config['TEMP_DIR'] = os.environ.get('TEMP_DIR', 'temp')
+app.config['MAX_CONCURRENT_DOWNLOADS'] = int(os.environ.get('MAX_CONCURRENT_DOWNLOADS', '3'))
+app.config['CLEANUP_INTERVAL_HOURS'] = int(os.environ.get('CLEANUP_INTERVAL_HOURS', '24'))
 
-def get_db_connection():
-    """Get database connection"""
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
-    return conn
+# Global variables for tracking downloads
+active_downloads: Dict[str, Dict[str, Any]] = {}
+download_lock = threading.Lock()
 
-def init_database():
-    """Initialize the database with sample data"""
-    conn = get_db_connection()
-    
-    # Create projects table
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS projects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT UNIQUE NOT NULL,
-            client_name TEXT NOT NULL,
-            is_active BOOLEAN DEFAULT 1,
-            last_checked DATETIME,
-            notes TEXT
-        )
-    ''')
-    
-    # Create access logs table
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS access_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT,
-            ip_address TEXT,
-            user_agent TEXT,
-            access_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-            status TEXT,
-            FOREIGN KEY (project_id) REFERENCES projects (project_id)
-        )
-    ''')
-    
-    # Insert sample projects
-    sample_projects = [
-        {
-            'project_id': 'proj_001_website',
-            'client_name': 'TTech',
-            'is_active': True,
-            'notes': 'Dawaa24'
-        },
-        {
-            'project_id': 'proj_002_app',
-            'client_name': 'TTech',
-            'is_active': False,
-            'notes': 'Provider Portal'
-        },
-        {
-            'project_id': 'proj_003_dashboard',
-            'client_name': 'TTech',
-            'is_active': True,
-            'notes': 'Pharmacy Portal'
-        }
-    ]
-    
-    for project in sample_projects:
-        try:
-            conn.execute('''
-                INSERT OR IGNORE INTO projects 
-                (project_id, client_name, is_active, notes)
-                VALUES (?, ?, ?, ?)
-            ''', (
-                project['project_id'],
-                project['client_name'],
-                project['is_active'],
-                project['notes']
-            ))
-        except sqlite3.IntegrityError:
-            pass  # Project already exists
-    
-    conn.commit()
-    conn.close()
-    print("✅ Database initialized successfully!")
-
-def require_auth(token_type='client'):
-    """Decorator for authentication"""
-    def decorator(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            auth_header = request.headers.get('Authorization')
-            
-            if not auth_header or not auth_header.startswith('Bearer '):
-                return jsonify({
-                    'success': False,
-                    'message': 'Missing or invalid authorization header'
-                }), 401
-            
-            token = auth_header.split(' ')[1]
-            
-            if token_type == 'admin' and token != ADMIN_TOKEN:
-                return jsonify({
-                    'success': False,
-                    'message': 'Invalid admin token'
-                }), 401
-            elif token_type == 'client' and token != SECRET_TOKEN:
-                return jsonify({
-                    'success': False,
-                    'message': 'Invalid client token'
-                }), 401
-            
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
-
-def log_access(project_id, status):
-    """Log access attempt"""
-    conn = get_db_connection()
-    conn.execute('''
-        INSERT INTO access_logs (project_id, ip_address, user_agent, status)
-        VALUES (?, ?, ?, ?)
-    ''', (
-        project_id,
-        request.remote_addr,
-        request.headers.get('User-Agent', 'Unknown'),
-        status
+# Setup logging
+if not app.debug:
+    if not os.path.exists('logs'):
+        os.mkdir('logs')
+    file_handler = RotatingFileHandler('logs/api.log', maxBytes=10240, backupCount=10)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
     ))
-    conn.commit()
-    conn.close()
+    file_handler.setLevel(logging.INFO)
+    app.logger.addHandler(file_handler)
+    app.logger.setLevel(logging.INFO)
+    app.logger.info('Video Downloader API startup')
 
-# ================================
-# API Routes
-# ================================
+# Create necessary directories
+Path(app.config['DOWNLOADS_DIR']).mkdir(exist_ok=True)
+Path(app.config['TEMP_DIR']).mkdir(exist_ok=True)
+
+
+class DownloadManager:
+    """Manages download tasks and cleanup"""
+    
+    def __init__(self):
+        self.cleanup_thread = threading.Thread(target=self._cleanup_old_files, daemon=True)
+        self.cleanup_thread.start()
+    
+    def _cleanup_old_files(self):
+        """Background task to cleanup old downloaded files"""
+        while True:
+            try:
+                cleanup_time = datetime.now() - timedelta(hours=app.config['CLEANUP_INTERVAL_HOURS'])
+                downloads_dir = Path(app.config['DOWNLOADS_DIR'])
+                
+                for file_path in downloads_dir.rglob('*'):
+                    if file_path.is_file():
+                        file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
+                        if file_mtime < cleanup_time:
+                            try:
+                                file_path.unlink()
+                                app.logger.info(f"Cleaned up old file: {file_path}")
+                            except Exception as e:
+                                app.logger.error(f"Failed to cleanup file {file_path}: {e}")
+                
+                # Sleep for 1 hour before next cleanup
+                time.sleep(3600)
+            except Exception as e:
+                app.logger.error(f"Error in cleanup thread: {e}")
+                time.sleep(3600)
+
+# Initialize download manager
+download_manager = DownloadManager()
+
+
+def download_worker(download_id: str, url: str, options: Dict[str, Any]):
+    """Worker function for downloading videos in background"""
+    try:
+        with download_lock:
+            active_downloads[download_id]['status'] = 'downloading'
+            active_downloads[download_id]['started_at'] = datetime.now().isoformat()
+        
+        # Create downloader instance
+        downloader = VideoDownloader(
+            output_dir=os.path.join(app.config['DOWNLOADS_DIR'], download_id),
+            quality=options.get('quality', 'best')
+        )
+        
+        # Download video
+        if options.get('playlist', False):
+            success = downloader.download_playlist(
+                url, 
+                options.get('max_downloads')
+            )
+        else:
+            success = downloader.download_video(
+                url,
+                options.get('audio_only', False),
+                options.get('subtitles')
+            )
+        
+        with download_lock:
+            if success:
+                active_downloads[download_id]['status'] = 'completed'
+                active_downloads[download_id]['completed_at'] = datetime.now().isoformat()
+                
+                # List downloaded files
+                download_dir = Path(app.config['DOWNLOADS_DIR']) / download_id
+                files = [f.name for f in download_dir.iterdir() if f.is_file()]
+                active_downloads[download_id]['files'] = files
+            else:
+                active_downloads[download_id]['status'] = 'failed'
+                active_downloads[download_id]['error'] = 'Download failed'
+                
+    except Exception as e:
+        app.logger.error(f"Download error for {download_id}: {e}")
+        with download_lock:
+            active_downloads[download_id]['status'] = 'failed'
+            active_downloads[download_id]['error'] = str(e)
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_file_too_large(e):
+    return jsonify({'error': 'Request too large'}), 413
+
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({'error': 'Internal server error'}), 500
+
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     return jsonify({
-        'success': True,
-        'message': 'License server is running',
-        'timestamp': datetime.datetime.now().isoformat(),
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'active_downloads': len(active_downloads),
         'version': '1.0.0'
     })
 
-@app.route('/api/validate/<project_id>', methods=['GET'])
-@require_auth('client')
-def validate_project(project_id):
-    """Validate project license"""
-    try:
-        conn = get_db_connection()
-        
-        # Update last checked time
-        conn.execute('''
-            UPDATE projects 
-            SET last_checked = CURRENT_TIMESTAMP 
-            WHERE project_id = ?
-        ''', (project_id,))
-        
-        # Get project details
-        project = conn.execute('''
-            SELECT * FROM projects WHERE project_id = ?
-        ''', (project_id,)).fetchone()
-        
-        conn.commit()
-        conn.close()
-        
-        if not project:
-            log_access(project_id, 'PROJECT_NOT_FOUND')
-            return jsonify({
-                'success': False,
-                'message': 'Project not found'
-            }), 404
-        
-        # Check if project is active
-        if not project['is_active']:
-            log_access(project_id, 'PROJECT_NOT_ACTIVE')
-            return jsonify({
-                'success': False,
-                'message': 'Project is not active'
-            }), 403
-        
-        log_access(project_id, 'VALID_ACCESS')
-        
-        return jsonify({
-            'success': True,
-            'message': 'Project license is active',
-            'data': {
-                'project_id': project['project_id'],
-                'client_name': project['client_name'],
-                'is_active': bool(project['is_active']),
-                'status': 'active' if project['is_active'] else 'not active',
-                'last_checked': project['last_checked']
-            }
-        })
-        
-    except Exception as e:
-        log_access(project_id, 'ERROR')
-        return jsonify({
-            'success': False,
-            'message': f'Server error: {str(e)}'
-        }), 500
 
-@app.route('/api/projects', methods=['GET'])
-@require_auth('admin')
-def list_projects():
-    """List all projects (Admin only)"""
-    try:
-        conn = get_db_connection()
-        projects = conn.execute('''
-            SELECT * FROM projects ORDER BY id DESC
-        ''').fetchall()
-        conn.close()
-        
-        projects_list = []
-        for project in projects:
-            projects_list.append({
-                'id': project['id'],
-                'project_id': project['project_id'],
-                'client_name': project['client_name'],
-                'is_active': bool(project['is_active']),
-                'status': 'active' if project['is_active'] else 'not active',
-                'last_checked': project['last_checked'],
-                'notes': project['notes']
-            })
-        
-        return jsonify({
-            'success': True,
-            'data': projects_list,
-            'count': len(projects_list)
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'message': f'Server error: {str(e)}'
-        }), 500
-
-@app.route('/api/projects/<project_id>', methods=['PUT'])
-@require_auth('admin')
-def update_project_status(project_id):
-    """Update project status (Admin only)"""
+@app.route('/api/info', methods=['POST'])
+def get_video_info():
+    """Get video information without downloading"""
     try:
         data = request.get_json()
-        is_active = data.get('is_active')
-        notes = data.get('notes')
+        if not data or 'url' not in data:
+            return jsonify({'error': 'URL is required'}), 400
         
-        conn = get_db_connection()
+        url = data['url']
         
-        # Check if project exists
-        project = conn.execute('''
-            SELECT * FROM projects WHERE project_id = ?
-        ''', (project_id,)).fetchone()
+        # Create temporary downloader instance
+        downloader = VideoDownloader(output_dir=app.config['TEMP_DIR'])
+        info = downloader.get_video_info(url)
         
-        if not project:
-            conn.close()
+        if info:
             return jsonify({
-                'success': False,
-                'message': 'Project not found'
-            }), 404
-        
-        # Update project
-        update_fields = []
-        params = []
-        
-        if is_active is not None:
-            update_fields.append('is_active = ?')
-            params.append(is_active)
+                'success': True,
+                'info': info
+            })
+        else:
+            return jsonify({'error': 'Failed to extract video information'}), 400
             
-        if notes is not None:
-            update_fields.append('notes = ?')
-            params.append(notes)
-        
-        if update_fields:
-            params.append(project_id)
-            query = f"UPDATE projects SET {', '.join(update_fields)} WHERE project_id = ?"
-            conn.execute(query, params)
-            conn.commit()
-        
-        # Get updated project
-        updated_project = conn.execute('''
-            SELECT * FROM projects WHERE project_id = ?
-        ''', (project_id,)).fetchone()
-        
-        conn.close()
-        
-        return jsonify({
-            'success': True,
-            'message': 'Project updated successfully',
-            'data': {
-                'project_id': updated_project['project_id'],
-                'client_name': updated_project['client_name'],
-                'is_active': bool(updated_project['is_active']),
-                'status': 'active' if updated_project['is_active'] else 'not active',
-                'notes': updated_project['notes']
-            }
-        })
-        
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'message': f'Server error: {str(e)}'
-        }), 500
+        app.logger.error(f"Info extraction error: {e}")
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/projects', methods=['POST'])
-@require_auth('admin')
-def create_project():
-    """Create new project (Admin only)"""
+
+@app.route('/api/formats', methods=['POST'])
+def get_video_formats():
+    """Get available video formats"""
     try:
         data = request.get_json()
+        if not data or 'url' not in data:
+            return jsonify({'error': 'URL is required'}), 400
         
-        required_fields = ['project_id', 'client_name']
-        for field in required_fields:
-            if not data.get(field):
-                return jsonify({
-                    'success': False,
-                    'message': f'Missing required field: {field}'
-                }), 400
+        url = data['url']
         
-        conn = get_db_connection()
+        # Create temporary downloader instance
+        downloader = VideoDownloader(output_dir=app.config['TEMP_DIR'])
+        formats = downloader.get_available_formats(url)
         
-        conn.execute('''
-            INSERT INTO projects (project_id, client_name, is_active, notes)
-            VALUES (?, ?, ?, ?)
-        ''', (
-            data['project_id'],
-            data['client_name'],
-            data.get('is_active', True),
-            data.get('notes', '')
-        ))
-        
-        conn.commit()
-        conn.close()
-        
-        return jsonify({
-            'success': True,
-            'message': 'Project created successfully',
-            'data': {
-                'project_id': data['project_id'],
-                'client_name': data['client_name'],
-                'is_active': data.get('is_active', True),
-                'status': 'active' if data.get('is_active', True) else 'not active'
-            }
-        }), 201
-        
-    except sqlite3.IntegrityError:
-        return jsonify({
-            'success': False,
-            'message': 'Project ID already exists'
-        }), 409
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'message': f'Server error: {str(e)}'
-        }), 500
-
-@app.route('/api/logs/<project_id>', methods=['GET'])
-@require_auth('admin')
-def get_project_logs(project_id):
-    """Get access logs for a project (Admin only)"""
-    try:
-        conn = get_db_connection()
-        logs = conn.execute('''
-            SELECT * FROM access_logs 
-            WHERE project_id = ? 
-            ORDER BY access_time DESC 
-            LIMIT 100
-        ''', (project_id,)).fetchall()
-        conn.close()
-        
-        logs_list = []
-        for log in logs:
-            logs_list.append({
-                'id': log['id'],
-                'project_id': log['project_id'],
-                'ip_address': log['ip_address'],
-                'user_agent': log['user_agent'],
-                'access_time': log['access_time'],
-                'status': log['status']
+        if formats:
+            return jsonify({
+                'success': True,
+                'formats': formats
             })
+        else:
+            return jsonify({'error': 'Failed to extract format information'}), 400
+            
+    except Exception as e:
+        app.logger.error(f"Format extraction error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/download', methods=['POST'])
+def start_download():
+    """Start video download"""
+    try:
+        data = request.get_json()
+        if not data or 'url' not in data:
+            return jsonify({'error': 'URL is required'}), 400
+        
+        # Check concurrent downloads limit
+        active_count = len([d for d in active_downloads.values() 
+                           if d['status'] in ['queued', 'downloading']])
+        
+        if active_count >= app.config['MAX_CONCURRENT_DOWNLOADS']:
+            return jsonify({
+                'error': f'Maximum concurrent downloads ({app.config["MAX_CONCURRENT_DOWNLOADS"]}) reached'
+            }), 429
+        
+        # Generate unique download ID
+        download_id = str(uuid.uuid4())
+        
+        # Prepare download options
+        options = {
+            'quality': data.get('quality', 'best'),
+            'audio_only': data.get('audio_only', False),
+            'subtitles': data.get('subtitles'),
+            'playlist': data.get('playlist', False),
+            'max_downloads': data.get('max_downloads')
+        }
+        
+        # Store download info
+        with download_lock:
+            active_downloads[download_id] = {
+                'url': data['url'],
+                'status': 'queued',
+                'created_at': datetime.now().isoformat(),
+                'options': options,
+                'files': []
+            }
+        
+        # Start download in background thread
+        thread = threading.Thread(
+            target=download_worker,
+            args=(download_id, data['url'], options)
+        )
+        thread.daemon = True
+        thread.start()
         
         return jsonify({
             'success': True,
-            'data': logs_list,
-            'count': len(logs_list)
+            'download_id': download_id,
+            'message': 'Download started'
+        }), 202
+        
+    except Exception as e:
+        app.logger.error(f"Download start error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/status/<download_id>', methods=['GET'])
+def get_download_status(download_id):
+    """Get download status"""
+    if download_id not in active_downloads:
+        return jsonify({'error': 'Download ID not found'}), 404
+    
+    return jsonify({
+        'success': True,
+        'download': active_downloads[download_id]
+    })
+
+
+@app.route('/api/downloads', methods=['GET'])
+def list_downloads():
+    """List all downloads with optional filtering"""
+    status_filter = request.args.get('status')
+    limit = request.args.get('limit', type=int)
+    
+    downloads = dict(active_downloads)
+    
+    if status_filter:
+        downloads = {k: v for k, v in downloads.items() 
+                    if v['status'] == status_filter}
+    
+    # Sort by creation time (newest first)
+    sorted_downloads = dict(sorted(downloads.items(), 
+                                  key=lambda x: x[1]['created_at'], 
+                                  reverse=True))
+    
+    if limit:
+        sorted_downloads = dict(list(sorted_downloads.items())[:limit])
+    
+    return jsonify({
+        'success': True,
+        'downloads': sorted_downloads,
+        'total': len(sorted_downloads)
+    })
+
+
+@app.route('/api/download/<download_id>/files/<filename>', methods=['GET'])
+def download_file(download_id, filename):
+    """Download a specific file"""
+    if download_id not in active_downloads:
+        return jsonify({'error': 'Download ID not found'}), 404
+    
+    download_info = active_downloads[download_id]
+    if download_info['status'] != 'completed':
+        return jsonify({'error': 'Download not completed'}), 400
+    
+    file_path = Path(app.config['DOWNLOADS_DIR']) / download_id / filename
+    
+    if not file_path.exists():
+        return jsonify({'error': 'File not found'}), 404
+    
+    try:
+        return send_file(
+            file_path,
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        app.logger.error(f"File download error: {e}")
+        return jsonify({'error': 'Failed to download file'}), 500
+
+
+@app.route('/api/download/<download_id>/cancel', methods=['POST'])
+def cancel_download(download_id):
+    """Cancel a download"""
+    if download_id not in active_downloads:
+        return jsonify({'error': 'Download ID not found'}), 404
+    
+    download_info = active_downloads[download_id]
+    if download_info['status'] not in ['queued', 'downloading']:
+        return jsonify({'error': 'Cannot cancel download in current state'}), 400
+    
+    with download_lock:
+        active_downloads[download_id]['status'] = 'cancelled'
+        active_downloads[download_id]['cancelled_at'] = datetime.now().isoformat()
+    
+    return jsonify({
+        'success': True,
+        'message': 'Download cancelled'
+    })
+
+
+@app.route('/api/download/<download_id>', methods=['DELETE'])
+def delete_download(download_id):
+    """Delete a download and its files"""
+    if download_id not in active_downloads:
+        return jsonify({'error': 'Download ID not found'}), 404
+    
+    try:
+        # Remove files
+        download_dir = Path(app.config['DOWNLOADS_DIR']) / download_id
+        if download_dir.exists():
+            import shutil
+            shutil.rmtree(download_dir)
+        
+        # Remove from active downloads
+        with download_lock:
+            del active_downloads[download_id]
+        
+        return jsonify({
+            'success': True,
+            'message': 'Download deleted'
         })
         
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'message': f'Server error: {str(e)}'
-        }), 500
+        app.logger.error(f"Delete download error: {e}")
+        return jsonify({'error': str(e)}), 500
 
-# ================================
-# Error Handlers
-# ================================
 
-@app.errorhandler(404)
-def not_found(error):
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """Get API statistics"""
+    stats = {
+        'total_downloads': len(active_downloads),
+        'by_status': {},
+        'active_count': 0,
+        'disk_usage': 0
+    }
+    
+    # Count by status
+    for download in active_downloads.values():
+        status = download['status']
+        stats['by_status'][status] = stats['by_status'].get(status, 0) + 1
+        if status in ['queued', 'downloading']:
+            stats['active_count'] += 1
+    
+    # Calculate disk usage
+    try:
+        downloads_dir = Path(app.config['DOWNLOADS_DIR'])
+        stats['disk_usage'] = sum(f.stat().st_size for f in downloads_dir.rglob('*') if f.is_file())
+    except Exception:
+        stats['disk_usage'] = 0
+    
     return jsonify({
-        'success': False,
-        'message': 'Endpoint not found'
-    }), 404
+        'success': True,
+        'stats': stats
+    })
 
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({
-        'success': False,
-        'message': 'Internal server error'
-    }), 500
-
-# ================================
-# Main Execution
-# ================================
 
 if __name__ == '__main__':
-    print("🚀 Starting Flask License Server...")
-    print("📁 Initializing database...")
+    port = int(os.environ.get('PORT', 5000))
+    debug = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     
-    # Initialize database
-    init_database()
-    
-    print("\n" + "="*50)
-    print("📋 API ENDPOINTS:")
-    print("="*50)
-    print("🔍 Health Check:")
-    print("   GET  /api/health")
-    print("\n🔐 Client Endpoints (Token: your-super-secret-token-2024):")
-    print("   GET  /api/validate/<project_id>")
-    print("\n👨‍💼 Admin Endpoints (Token: admin-secret-token-2024):")
-    print("   GET  /api/projects")
-    print("   POST /api/projects")
-    print("   PUT  /api/projects/<project_id>")
-    print("   GET  /api/logs/<project_id>")
-    print("\n📝 Sample Project IDs:")
-    print("   - proj_001_website (Active)")
-    print("   - proj_002_app (Not Active)")
-    print("   - proj_003_dashboard (Active)")
-    print("="*50)
-    print("\n🌐 Server starting on http://localhost:5000")
-    print("💡 Use Ctrl+C to stop the server")
-    
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(
+        host='0.0.0.0',
+        port=port,
+        debug=debug,
+        threaded=True
+    )
