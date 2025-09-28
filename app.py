@@ -25,10 +25,12 @@ from video_downloader import VideoDownloader
 app = Flask(__name__)
 CORS(app)
 
-# Configuration
+# Configuration - Updated to use local paths
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max request size
-app.config['DOWNLOADS_DIR'] = os.environ.get('DOWNLOADS_DIR', 'downloads')
-app.config['TEMP_DIR'] = os.environ.get('TEMP_DIR', 'temp')
+# Use local Downloads directory instead of server directory
+local_downloads_base = Path.home() / "Downloads" / "VideoDownloaderAPI"
+app.config['DOWNLOADS_DIR'] = str(local_downloads_base)
+app.config['TEMP_DIR'] = str(local_downloads_base / "temp")
 app.config['MAX_CONCURRENT_DOWNLOADS'] = int(os.environ.get('MAX_CONCURRENT_DOWNLOADS', '3'))
 app.config['CLEANUP_INTERVAL_HOURS'] = int(os.environ.get('CLEANUP_INTERVAL_HOURS', '24'))
 
@@ -36,11 +38,11 @@ app.config['CLEANUP_INTERVAL_HOURS'] = int(os.environ.get('CLEANUP_INTERVAL_HOUR
 active_downloads: Dict[str, Dict[str, Any]] = {}
 download_lock = threading.Lock()
 
-# Setup logging
+# Setup logging - Also use local directory for logs
+local_logs_dir = local_downloads_base / "logs"
 if not app.debug:
-    if not os.path.exists('logs'):
-        os.mkdir('logs')
-    file_handler = RotatingFileHandler('logs/api.log', maxBytes=10240, backupCount=10)
+    local_logs_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(local_logs_dir / 'api.log', maxBytes=10240, backupCount=10)
     file_handler.setFormatter(logging.Formatter(
         '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
     ))
@@ -49,9 +51,9 @@ if not app.debug:
     app.logger.setLevel(logging.INFO)
     app.logger.info('Video Downloader API startup')
 
-# Create necessary directories
-Path(app.config['DOWNLOADS_DIR']).mkdir(exist_ok=True)
-Path(app.config['TEMP_DIR']).mkdir(exist_ok=True)
+# Create necessary directories in local machine
+Path(app.config['DOWNLOADS_DIR']).mkdir(parents=True, exist_ok=True)
+Path(app.config['TEMP_DIR']).mkdir(parents=True, exist_ok=True)
 
 
 class DownloadManager:
@@ -95,9 +97,10 @@ def download_worker(download_id: str, url: str, options: Dict[str, Any]):
             active_downloads[download_id]['status'] = 'downloading'
             active_downloads[download_id]['started_at'] = datetime.now().isoformat()
         
-        # Create downloader instance
+        # Create downloader instance with local path
+        local_download_path = os.path.join(app.config['DOWNLOADS_DIR'], download_id)
         downloader = VideoDownloader(
-            output_dir=os.path.join(app.config['DOWNLOADS_DIR'], download_id),
+            output_dir=local_download_path,
             quality=options.get('quality', 'best')
         )
         
@@ -119,10 +122,11 @@ def download_worker(download_id: str, url: str, options: Dict[str, Any]):
                 active_downloads[download_id]['status'] = 'completed'
                 active_downloads[download_id]['completed_at'] = datetime.now().isoformat()
                 
-                # List downloaded files
+                # List downloaded files from local directory
                 download_dir = Path(app.config['DOWNLOADS_DIR']) / download_id
                 files = [f.name for f in download_dir.iterdir() if f.is_file()]
                 active_downloads[download_id]['files'] = files
+                active_downloads[download_id]['local_path'] = str(download_dir)
             else:
                 active_downloads[download_id]['status'] = 'failed'
                 active_downloads[download_id]['error'] = 'Download failed'
@@ -156,7 +160,8 @@ def health_check():
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
         'active_downloads': len(active_downloads),
-        'version': '1.0.0'
+        'version': '1.0.0',
+        'download_location': app.config['DOWNLOADS_DIR']
     })
 
 
@@ -170,7 +175,7 @@ def get_video_info():
         
         url = data['url']
         
-        # Create temporary downloader instance
+        # Create temporary downloader instance with local temp directory
         downloader = VideoDownloader(output_dir=app.config['TEMP_DIR'])
         info = downloader.get_video_info(url)
         
@@ -197,7 +202,7 @@ def get_video_formats():
         
         url = data['url']
         
-        # Create temporary downloader instance
+        # Create temporary downloader instance with local temp directory
         downloader = VideoDownloader(output_dir=app.config['TEMP_DIR'])
         formats = downloader.get_available_formats(url)
         
@@ -243,14 +248,16 @@ def start_download():
             'max_downloads': data.get('max_downloads')
         }
         
-        # Store download info
+        # Store download info with local path information
+        local_download_path = Path(app.config['DOWNLOADS_DIR']) / download_id
         with download_lock:
             active_downloads[download_id] = {
                 'url': data['url'],
                 'status': 'queued',
                 'created_at': datetime.now().isoformat(),
                 'options': options,
-                'files': []
+                'files': [],
+                'local_path': str(local_download_path)
             }
         
         # Start download in background thread
@@ -264,7 +271,8 @@ def start_download():
         return jsonify({
             'success': True,
             'download_id': download_id,
-            'message': 'Download started'
+            'message': 'Download started',
+            'local_path': str(local_download_path)
         }), 202
         
     except Exception as e:
@@ -313,7 +321,7 @@ def list_downloads():
 
 @app.route('/api/download/<download_id>/files/<filename>', methods=['GET'])
 def download_file(download_id, filename):
-    """Download a specific file"""
+    """Download a specific file from local storage"""
     if download_id not in active_downloads:
         return jsonify({'error': 'Download ID not found'}), 404
     
@@ -321,6 +329,7 @@ def download_file(download_id, filename):
     if download_info['status'] != 'completed':
         return jsonify({'error': 'Download not completed'}), 400
     
+    # Use local file path
     file_path = Path(app.config['DOWNLOADS_DIR']) / download_id / filename
     
     if not file_path.exists():
@@ -359,12 +368,12 @@ def cancel_download(download_id):
 
 @app.route('/api/download/<download_id>', methods=['DELETE'])
 def delete_download(download_id):
-    """Delete a download and its files"""
+    """Delete a download and its files from local storage"""
     if download_id not in active_downloads:
         return jsonify({'error': 'Download ID not found'}), 404
     
     try:
-        # Remove files
+        # Remove files from local directory
         download_dir = Path(app.config['DOWNLOADS_DIR']) / download_id
         if download_dir.exists():
             import shutil
@@ -391,7 +400,8 @@ def get_stats():
         'total_downloads': len(active_downloads),
         'by_status': {},
         'active_count': 0,
-        'disk_usage': 0
+        'disk_usage': 0,
+        'download_location': app.config['DOWNLOADS_DIR']
     }
     
     # Count by status
@@ -401,7 +411,7 @@ def get_stats():
         if status in ['queued', 'downloading']:
             stats['active_count'] += 1
     
-    # Calculate disk usage
+    # Calculate disk usage from local directory
     try:
         downloads_dir = Path(app.config['DOWNLOADS_DIR'])
         stats['disk_usage'] = sum(f.stat().st_size for f in downloads_dir.rglob('*') if f.is_file())
@@ -415,6 +425,9 @@ def get_stats():
 
 
 if __name__ == '__main__':
+    # Print local download location for reference
+    print(f"Local download location: {app.config['DOWNLOADS_DIR']}")
+    
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     
