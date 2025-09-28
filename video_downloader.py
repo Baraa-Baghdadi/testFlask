@@ -34,18 +34,8 @@ class VideoDownloader:
             output_dir: Directory to save downloaded videos
             quality: Video quality preference (best, worst, or specific format)
         """
-        # Get user's home directory and create Downloads folder
-        home_dir = Path.home()
-        local_downloads = home_dir / "Downloads" / "VideoDownloader"
-        
-        # If output_dir is default "downloads", use local Downloads folder
-        if output_dir == "downloads":
-            self.output_dir = local_downloads
-        else:
-            # If custom path provided, make it relative to user's Downloads
-            self.output_dir = local_downloads / output_dir
-        
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True)
         self.quality = quality
         self.setup_logging()
         
@@ -107,7 +97,7 @@ class VideoDownloader:
         Returns:
             Dictionary of yt-dlp options
         """
-        # Create safe filename template with local path
+        # Create safe filename template
         filename_template = str(self.output_dir / "%(title)s.%(ext)s")
         
         ydl_opts = {
@@ -265,7 +255,7 @@ Examples:
     
     parser.add_argument('url', help='Video URL to download')
     parser.add_argument('-o', '--output', default='downloads', 
-                       help='Output directory (default: ~/Downloads/VideoDownloader)')
+                       help='Output directory (default: downloads)')
     parser.add_argument('-q', '--quality', default='best',
                        help='Video quality (best, worst, 720p, 480p, etc.)')
     parser.add_argument('--audio-only', action='store_true',
@@ -288,9 +278,6 @@ Examples:
     
     # Initialize downloader
     downloader = VideoDownloader(args.output, args.quality)
-    
-    # Print download location for user reference
-    print(f"Download location: {downloader.output_dir}")
     
     if args.info_only:
         info = downloader.get_video_info(args.url)
@@ -328,7 +315,7 @@ Examples:
     
     if success:
         print(f"\n✅ Download completed successfully!")
-        print(f"Files saved to: {downloader.output_dir}")
+        print(f"Files saved to: {args.output}")
     else:
         print(f"\n❌ Download failed. Check the log file for details.")
         sys.exit(1)
