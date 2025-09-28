@@ -25,12 +25,10 @@ from video_downloader import VideoDownloader
 app = Flask(__name__)
 CORS(app)
 
-# Configuration - Updated to use local paths
+# Configuration - Use server temp directory for processing
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max request size
-# Use local Downloads directory instead of server directory
-local_downloads_base = Path.home() / "Downloads" / "VideoDownloaderAPI"
-app.config['DOWNLOADS_DIR'] = str(local_downloads_base)
-app.config['TEMP_DIR'] = str(local_downloads_base / "temp")
+app.config['DOWNLOADS_DIR'] = os.environ.get('DOWNLOADS_DIR', 'temp_downloads')
+app.config['TEMP_DIR'] = os.environ.get('TEMP_DIR', 'temp')
 app.config['MAX_CONCURRENT_DOWNLOADS'] = int(os.environ.get('MAX_CONCURRENT_DOWNLOADS', '3'))
 app.config['CLEANUP_INTERVAL_HOURS'] = int(os.environ.get('CLEANUP_INTERVAL_HOURS', '24'))
 
@@ -38,11 +36,11 @@ app.config['CLEANUP_INTERVAL_HOURS'] = int(os.environ.get('CLEANUP_INTERVAL_HOUR
 active_downloads: Dict[str, Dict[str, Any]] = {}
 download_lock = threading.Lock()
 
-# Setup logging - Also use local directory for logs
-local_logs_dir = local_downloads_base / "logs"
+# Setup logging - Use server directory for logs
 if not app.debug:
-    local_logs_dir.mkdir(parents=True, exist_ok=True)
-    file_handler = RotatingFileHandler(local_logs_dir / 'api.log', maxBytes=10240, backupCount=10)
+    if not os.path.exists('logs'):
+        os.mkdir('logs')
+    file_handler = RotatingFileHandler('logs/api.log', maxBytes=10240, backupCount=10)
     file_handler.setFormatter(logging.Formatter(
         '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
     ))
@@ -51,7 +49,7 @@ if not app.debug:
     app.logger.setLevel(logging.INFO)
     app.logger.info('Video Downloader API startup')
 
-# Create necessary directories in local machine
+# Create necessary directories on server
 Path(app.config['DOWNLOADS_DIR']).mkdir(parents=True, exist_ok=True)
 Path(app.config['TEMP_DIR']).mkdir(parents=True, exist_ok=True)
 
@@ -97,14 +95,14 @@ def download_worker(download_id: str, url: str, options: Dict[str, Any]):
             active_downloads[download_id]['status'] = 'downloading'
             active_downloads[download_id]['started_at'] = datetime.now().isoformat()
         
-        # Create downloader instance with local path
-        local_download_path = os.path.join(app.config['DOWNLOADS_DIR'], download_id)
+        # Create downloader instance with server temp path
+        server_download_path = os.path.join(app.config['DOWNLOADS_DIR'], download_id)
         downloader = VideoDownloader(
-            output_dir=local_download_path,
+            output_dir=server_download_path,
             quality=options.get('quality', 'best')
         )
         
-        # Download video
+        # Download video to server temporarily
         if options.get('playlist', False):
             success = downloader.download_playlist(
                 url, 
@@ -122,11 +120,19 @@ def download_worker(download_id: str, url: str, options: Dict[str, Any]):
                 active_downloads[download_id]['status'] = 'completed'
                 active_downloads[download_id]['completed_at'] = datetime.now().isoformat()
                 
-                # List downloaded files from local directory
+                # List downloaded files and create download URLs
                 download_dir = Path(app.config['DOWNLOADS_DIR']) / download_id
-                files = [f.name for f in download_dir.iterdir() if f.is_file()]
+                files = []
+                for f in download_dir.iterdir():
+                    if f.is_file():
+                        files.append({
+                            'name': f.name,
+                            'size': f.stat().st_size,
+                            'download_url': f'/api/download/{download_id}/files/{f.name}'
+                        })
+                
                 active_downloads[download_id]['files'] = files
-                active_downloads[download_id]['local_path'] = str(download_dir)
+                active_downloads[download_id]['message'] = 'Files ready for download. Use the download_url to get each file.'
             else:
                 active_downloads[download_id]['status'] = 'failed'
                 active_downloads[download_id]['error'] = 'Download failed'
@@ -248,16 +254,14 @@ def start_download():
             'max_downloads': data.get('max_downloads')
         }
         
-        # Store download info with local path information
-        local_download_path = Path(app.config['DOWNLOADS_DIR']) / download_id
+        # Store download info
         with download_lock:
             active_downloads[download_id] = {
                 'url': data['url'],
                 'status': 'queued',
                 'created_at': datetime.now().isoformat(),
                 'options': options,
-                'files': [],
-                'local_path': str(local_download_path)
+                'files': []
             }
         
         # Start download in background thread
@@ -271,8 +275,8 @@ def start_download():
         return jsonify({
             'success': True,
             'download_id': download_id,
-            'message': 'Download started',
-            'local_path': str(local_download_path)
+            'message': 'Download started. Check status for download links when completed.',
+            'status_url': f'/api/status/{download_id}'
         }), 202
         
     except Exception as e:
@@ -321,7 +325,7 @@ def list_downloads():
 
 @app.route('/api/download/<download_id>/files/<filename>', methods=['GET'])
 def download_file(download_id, filename):
-    """Download a specific file from local storage"""
+    """Stream file directly to client for download"""
     if download_id not in active_downloads:
         return jsonify({'error': 'Download ID not found'}), 404
     
@@ -329,18 +333,37 @@ def download_file(download_id, filename):
     if download_info['status'] != 'completed':
         return jsonify({'error': 'Download not completed'}), 400
     
-    # Use local file path
+    # Use server file path
     file_path = Path(app.config['DOWNLOADS_DIR']) / download_id / filename
     
     if not file_path.exists():
         return jsonify({'error': 'File not found'}), 404
     
     try:
-        return send_file(
+        # Stream file to client and delete from server after sending
+        def remove_file(response):
+            try:
+                if file_path.exists():
+                    file_path.unlink()
+                    # If directory is empty, remove it too
+                    parent_dir = file_path.parent
+                    if parent_dir.exists() and not any(parent_dir.iterdir()):
+                        parent_dir.rmdir()
+            except Exception as e:
+                app.logger.error(f"Failed to cleanup file {file_path}: {e}")
+            return response
+        
+        response = send_file(
             file_path,
             as_attachment=True,
             download_name=filename
         )
+        
+        # Clean up file after sending (for production, you might want to delay this)
+        # response.call_on_close(lambda: remove_file(response))
+        
+        return response
+        
     except Exception as e:
         app.logger.error(f"File download error: {e}")
         return jsonify({'error': 'Failed to download file'}), 500
