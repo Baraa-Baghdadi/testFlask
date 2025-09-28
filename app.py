@@ -272,7 +272,8 @@ def start_download():
         return jsonify({
             'success': True,
             'download_id': download_id,
-            'files': mp4_files
+            'files': mp4_files,
+            'file_url' = f"https://testflask-ixf3.onrender.com/api/download/{download_id}/files/{mp4_files[0]}"
         })
 
     except Exception as e:
