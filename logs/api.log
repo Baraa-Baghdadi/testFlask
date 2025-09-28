@@ -2,3 +2,4 @@
 2025-09-28 16:38:57,291 INFO: Video Downloader API startup [in D:\license-api\deploy\app.py:50]
 2025-09-28 16:45:23,054 ERROR: Download error for f404d673-9a8d-44b9-abb7-24de3b8856d8: [WinError 3] The system cannot find the path specified: 'downloads\\f404d673-9a8d-44b9-abb7-24de3b8856d8' [in D:\license-api\deploy\app.py:131]
 2025-09-28 19:42:17,605 INFO: Video Downloader API startup [in D:\license-api\deploy\app.py:50]
+2025-09-28 19:48:30,423 INFO: Video Downloader API startup [in D:\license-api\deploy\app.py:50]
